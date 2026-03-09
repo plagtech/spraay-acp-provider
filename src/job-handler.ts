@@ -1,28 +1,44 @@
-import { SpraayGatewayClient, GatewayResponse } from "./gateway-client.js";
-import { OFFERING_MAP, LIVE_OFFERINGS, JobOffering } from "./offerings.js";
+/**
+ * job-handler.ts
+ *
+ * Merged job handler for Spraay ACP Provider v2.
+ *
+ * Primary mode:  Claude reasoning engine (interprets NL, picks tools, chains calls)
+ * Fallback mode: Keyword routing (original v1 logic, used if Claude is unavailable)
+ *
+ * The handler is called by ACP SDK callbacks (onNewTask) or polling loop.
+ */
+
+import { SpraayGatewayClient, type GatewayResponse } from "./gateway-client.js";
+import { OFFERING_MAP, LIVE_OFFERINGS, type JobOffering } from "./offerings.js";
+import { ClaudeReasoningEngine, type ReasoningResult } from "./claude-engine.js";
+
+// ---------- Types ----------
 
 /**
- * AcpJob shape from @virtuals-protocol/acp-node SDK.
- * We keep our own interface to stay resilient if the SDK's types shift.
- * The SDK provides these methods on the job object passed to onNewTask.
+ * Flexible AcpJob interface — works across SDK versions.
+ * The actual SDK type has `id: number`, but polling may return different shapes.
+ * We keep this resilient.
  */
 export interface AcpJob {
-  id: string;
-  // The SDK passes the buyer's requirement text here
+  id: string | number;
+  // Job metadata
+  name?: string;
   serviceRequirement?: string;
-  // Some SDK versions include offering info
+  requirement?: Record<string, any> | string;
   offeringId?: string;
   offeringName?: string;
-  // Extra structured data (may or may not be present)
   params?: Record<string, any>;
-  // SDK-provided lifecycle methods
-  accept: (reason: string) => Promise<void>;
-  reject: (reason: string) => Promise<void>;
-  createRequirement: (requirement: string) => Promise<void>;
-  deliver: (deliverable: string) => Promise<void>;
-  // These may exist on newer SDK versions
+  clientAddress?: string;
+  price?: number;
+  phase?: number;
+  // SDK lifecycle methods
+  accept: (reason: string) => Promise<any>;
+  reject: (reason: string) => Promise<any>;
+  createRequirement: (requirement: string) => Promise<any>;
+  deliver: (deliverable: string | Record<string, unknown>) => Promise<any>;
   evaluate?: (accept: boolean, reasoning: string) => Promise<void>;
-  payAndAcceptRequirement?: () => Promise<void>;
+  payAndAcceptRequirement?: () => Promise<any>;
 }
 
 export interface JobResult {
@@ -30,11 +46,14 @@ export interface JobResult {
   offeringId: string;
   offeringName: string;
   gatewayResponse?: GatewayResponse;
+  claudeResult?: ReasoningResult;
   error?: string;
   executionTimeMs: number;
+  mode: "claude" | "keyword";
 }
 
-// Keywords mapped to offering IDs for fuzzy matching
+// ---------- Keyword routing (v1 fallback) ----------
+
 const KEYWORD_MAP: Record<string, string> = {
   payroll: "spraay_batch_payroll",
   batch: "spraay_batch_payroll",
@@ -75,177 +94,199 @@ const KEYWORD_MAP: Record<string, string> = {
   question: "spraay_qna",
 };
 
+// ---------- Handler ----------
+
 export class JobHandler {
   private gateway: SpraayGatewayClient;
+  private claudeEngine: ClaudeReasoningEngine | null = null;
+  private useClaudeReasoning: boolean;
   private stats = {
     totalJobs: 0,
     successfulJobs: 0,
     failedJobs: 0,
     totalRevenue: 0,
     totalGatewayCost: 0,
+    claudeJobs: 0,
+    keywordJobs: 0,
   };
 
-  constructor(gateway: SpraayGatewayClient) {
+  constructor(gateway: SpraayGatewayClient, options?: { useClaude?: boolean }) {
     this.gateway = gateway;
+    this.useClaudeReasoning = options?.useClaude ?? (process.env.USE_CLAUDE_REASONING !== "false");
+
+    if (this.useClaudeReasoning && process.env.ANTHROPIC_API_KEY) {
+      try {
+        this.claudeEngine = new ClaudeReasoningEngine(gateway);
+        console.log("[handler] Claude reasoning engine: ENABLED");
+      } catch (err: any) {
+        console.warn(`[handler] Claude init failed: ${err.message} — falling back to keyword routing`);
+        this.claudeEngine = null;
+      }
+    } else {
+      console.log("[handler] Claude reasoning: DISABLED (keyword routing mode)");
+    }
   }
 
   /**
-   * Resolve which offering to use based on the job's requirement text.
-   * Priority: exact offeringId > keyword match > best fuzzy score
-   */
-  private resolveOffering(job: AcpJob): JobOffering | null {
-    // 1) Direct offering ID match
-    if (job.offeringId && OFFERING_MAP.has(job.offeringId)) {
-      return OFFERING_MAP.get(job.offeringId)!;
-    }
-
-    const req = (job.serviceRequirement || "").toLowerCase();
-    if (!req) return null;
-
-    // 2) Keyword map — first match wins
-    for (const [keyword, offeringId] of Object.entries(KEYWORD_MAP)) {
-      if (req.includes(keyword)) {
-        const offering = OFFERING_MAP.get(offeringId);
-        if (offering) return offering;
-      }
-    }
-
-    // 3) Fuzzy match against offering names/descriptions
-    let bestMatch: JobOffering | null = null;
-    let bestScore = 0;
-    for (const offering of LIVE_OFFERINGS) {
-      let score = 0;
-      const words = req.split(/\s+/);
-      const nameWords = offering.name.toLowerCase().split(/\s+/);
-      const descWords = offering.description.toLowerCase().split(/\s+/);
-      for (const w of words) {
-        if (nameWords.some((nw) => nw.includes(w) || w.includes(nw))) score += 5;
-        if (descWords.some((dw) => dw.includes(w) || w.includes(dw))) score += 2;
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        bestMatch = offering;
-      }
-    }
-    return bestScore >= 5 ? bestMatch : null;
-  }
-
-  /**
-   * Extract structured params from the job.
-   * Tries: job.params → JSON block in serviceRequirement → raw text
-   */
-  private extractParams(job: AcpJob, _offering: JobOffering): Record<string, any> {
-    // Already structured
-    if (job.params && typeof job.params === "object" && Object.keys(job.params).length > 0) {
-      return job.params;
-    }
-
-    // Try to extract JSON from the requirement text
-    const req = job.serviceRequirement || "";
-    try {
-      const jsonMatch = req.match(/\{[\s\S]*\}/);
-      if (jsonMatch) return JSON.parse(jsonMatch[0]);
-    } catch {
-      // not valid JSON, fall through
-    }
-
-    // Return raw request text as the primary param
-    return { raw_request: req };
-  }
-
-  /**
-   * Main job handler — called by ACP SDK's onNewTask callback.
+   * Main job handler — entry point for ACP jobs.
    */
   async handleJob(job: AcpJob): Promise<JobResult> {
     const start = Date.now();
     this.stats.totalJobs++;
 
-    console.log(`\n${"=".repeat(50)}`);
-    console.log(`[job] New ACP Job: ${job.id}`);
-    console.log(`[job] Requirement: ${job.serviceRequirement || "(empty)"}`);
-    if (job.offeringId) console.log(`[job] Offering ID: ${job.offeringId}`);
+    const jobDesc = this.extractJobDescription(job);
 
-    // Step 1: Resolve which offering this maps to
-    const offering = this.resolveOffering(job);
+    console.log(`\n${"=".repeat(60)}`);
+    console.log(`[job] 💧 ACP Job: ${job.id}`);
+    console.log(`[job] Request: ${jobDesc.slice(0, 150)}${jobDesc.length > 150 ? "..." : ""}`);
+
+    // Try Claude first, fall back to keyword routing
+    if (this.claudeEngine) {
+      try {
+        return await this.handleWithClaude(job, jobDesc, start);
+      } catch (err: any) {
+        console.warn(`[job] Claude failed, falling back to keywords: ${err.message}`);
+      }
+    }
+
+    return await this.handleWithKeywords(job, jobDesc, start);
+  }
+
+  // ─── Claude Reasoning Path ──────────────────────────────────
+
+  private async handleWithClaude(job: AcpJob, jobDesc: string, start: number): Promise<JobResult> {
+    console.log(`[job] 🧠 Using Claude reasoning...`);
+    this.stats.claudeJobs++;
+
+    // Accept the job
+    try {
+      await job.accept("Spraay Agent processing your request with AI reasoning. Stand by.");
+      console.log("[job] ✓ Accepted");
+    } catch (e: any) {
+      console.warn(`[job] accept() error: ${e.message?.slice(0, 80)}`);
+    }
+
+    // Build context
+    const context = [
+      job.clientAddress ? `Buyer address: ${job.clientAddress}` : "",
+      job.price ? `Job price: $${job.price} USDC` : "",
+      job.name ? `Service: ${job.name}` : "",
+    ].filter(Boolean).join("\n");
+
+    // Process through Claude
+    const result = await this.claudeEngine!.processJob(jobDesc, context || undefined);
+
+    console.log(`[job] 🧠 Claude: success=${result.success}, tools=${result.toolCallCount}, cost=$${result.totalGatewayCost.toFixed(4)}`);
+    console.log(`[job] Offerings used: ${result.offeringsUsed.join(", ") || "none"}`);
+
+    // Build deliverable
+    const deliverable = JSON.stringify({
+      agent: "Spraay ACP Provider v2.0 (Claude-powered)",
+      jobId: String(job.id),
+      status: result.success ? "completed" : "failed",
+      summary: result.summary,
+      services_used: result.offeringsUsed,
+      metrics: {
+        tool_calls: result.toolCallCount,
+        gateway_cost_usdc: result.totalGatewayCost.toFixed(4),
+        execution_time_ms: Date.now() - start,
+      },
+      results: result.results.map((r) => ({
+        endpoint: r.endpoint,
+        success: r.success,
+        data: r.data,
+        error: r.error,
+        latency_ms: r.latencyMs,
+      })),
+      powered_by: "Spraay x402 Gateway + Claude AI",
+      ...(result.error ? { error: result.error } : {}),
+    });
+
+    // Deliver
+    try {
+      await job.deliver(deliverable);
+      console.log("[job] ✓ Delivered to buyer");
+    } catch (e: any) {
+      console.error(`[job] deliver() failed: ${e.message}`);
+    }
+
+    // Update stats
+    if (result.success) {
+      this.stats.successfulJobs++;
+      // Revenue = sum of ACP prices for offerings used
+      for (const id of result.offeringsUsed) {
+        const offering = OFFERING_MAP.get(id);
+        if (offering) this.stats.totalRevenue += parseFloat(offering.acpPrice);
+      }
+      this.stats.totalGatewayCost += result.totalGatewayCost;
+    } else {
+      this.stats.failedJobs++;
+    }
+
+    console.log(`${"=".repeat(60)}\n`);
+    this.printStats();
+
+    return {
+      success: result.success,
+      offeringId: result.offeringsUsed[0] || "multi",
+      offeringName: result.offeringsUsed.map((id) => OFFERING_MAP.get(id)?.name || id).join(" + "),
+      claudeResult: result,
+      executionTimeMs: Date.now() - start,
+      mode: "claude",
+    };
+  }
+
+  // ─── Keyword Routing Path (v1 fallback) ─────────────────────
+
+  private async handleWithKeywords(job: AcpJob, jobDesc: string, start: number): Promise<JobResult> {
+    console.log(`[job] 📋 Using keyword routing (fallback)...`);
+    this.stats.keywordJobs++;
+
+    const offering = this.resolveByKeywords(jobDesc, job.offeringId);
     if (!offering) {
       const availableServices = LIVE_OFFERINGS.map((o) => o.name).join(", ");
       const rejectMsg = `Could not match your request to a service. Available: ${availableServices}`;
-      console.log(`[job] ✗ No matching offering found`);
-      try {
-        await job.reject(rejectMsg);
-      } catch (e: any) {
-        console.error(`[job] reject() failed: ${e.message}`);
-      }
+      console.log(`[job] ✗ No matching offering`);
+      try { await job.reject(rejectMsg); } catch {}
       this.stats.failedJobs++;
-      return {
-        success: false,
-        offeringId: "unknown",
-        offeringName: "Unknown",
-        error: "No matching offering",
-        executionTimeMs: Date.now() - start,
-      };
+      return { success: false, offeringId: "unknown", offeringName: "Unknown", error: "No match", executionTimeMs: Date.now() - start, mode: "keyword" };
     }
 
-    console.log(`[job] ✓ Matched: ${offering.name} (ACP: $${offering.acpPrice}, Gateway: $${offering.gatewayCost})`);
+    console.log(`[job] ✓ Matched: ${offering.name} (ACP: $${offering.acpPrice})`);
 
-    // Step 2: Accept the job
     try {
       await job.accept(`Processing "${offering.name}" via Spraay x402 gateway.`);
-      console.log(`[job] Accepted`);
-    } catch (e: any) {
-      console.error(`[job] accept() failed: ${e.message}`);
-      // Continue anyway — some SDK versions don't require explicit accept
-    }
+    } catch {}
 
-    // Step 3: Extract params and call gateway
-    const params = this.extractParams(job, offering);
-    console.log(`[job] Params:`, JSON.stringify(params).slice(0, 200));
-    console.log(`[job] Calling gateway...`);
+    const params = this.extractParams(job, jobDesc);
+    const result = await this.gateway.executeByOffering(offering.id, params);
 
-    const result = await this.gateway.executeJob(offering.id, params);
-
-    // Step 4: Deliver result
     if (result.success) {
-      console.log(`[job] ✓ Gateway OK (${result.latencyMs}ms)`);
       const deliverable = JSON.stringify({
+        agent: "Spraay ACP Provider v2.0 (keyword mode)",
         service: offering.name,
         status: "completed",
         result: result.data,
         execution_time_ms: result.latencyMs,
         gateway_cost_usdc: result.gatewayCost,
         powered_by: "Spraay x402 Gateway",
-        docs: "https://docs.spraay.app",
       });
-
-      try {
-        await job.deliver(deliverable);
-        console.log(`[job] ✓ Delivered to buyer`);
-      } catch (e: any) {
-        console.error(`[job] deliver() failed: ${e.message}`);
-      }
-
+      try { await job.deliver(deliverable); console.log("[job] ✓ Delivered"); } catch {}
       this.stats.successfulJobs++;
       this.stats.totalRevenue += parseFloat(offering.acpPrice);
       this.stats.totalGatewayCost += parseFloat(offering.gatewayCost);
     } else {
-      console.log(`[job] ✗ Gateway failed: ${result.error}`);
       const errorDeliverable = JSON.stringify({
         service: offering.name,
         status: "failed",
         error: result.error,
         powered_by: "Spraay x402 Gateway",
       });
-
-      try {
-        await job.deliver(errorDeliverable);
-      } catch (e: any) {
-        console.error(`[job] deliver(error) failed: ${e.message}`);
-      }
-
+      try { await job.deliver(errorDeliverable); } catch {}
       this.stats.failedJobs++;
     }
 
-    console.log(`${"=".repeat(50)}\n`);
+    console.log(`${"=".repeat(60)}\n`);
     this.printStats();
 
     return {
@@ -254,17 +295,65 @@ export class JobHandler {
       offeringName: offering.name,
       gatewayResponse: result,
       executionTimeMs: Date.now() - start,
+      mode: "keyword",
     };
   }
+
+  // ─── Helpers ────────────────────────────────────────────────
+
+  private extractJobDescription(job: AcpJob): string {
+    // Try all possible locations for the job request text
+    if (job.serviceRequirement) return job.serviceRequirement;
+    if (typeof job.requirement === "string") return job.requirement;
+    if (job.requirement && typeof job.requirement === "object") return JSON.stringify(job.requirement);
+    if (job.name) return job.name;
+    return "(empty request)";
+  }
+
+  private resolveByKeywords(text: string, directOfferingId?: string): JobOffering | null {
+    if (directOfferingId && OFFERING_MAP.has(directOfferingId)) {
+      return OFFERING_MAP.get(directOfferingId)!;
+    }
+    const req = text.toLowerCase();
+    for (const [keyword, offeringId] of Object.entries(KEYWORD_MAP)) {
+      if (req.includes(keyword)) {
+        return OFFERING_MAP.get(offeringId) || null;
+      }
+    }
+    // Fuzzy
+    let best: JobOffering | null = null;
+    let bestScore = 0;
+    for (const offering of LIVE_OFFERINGS) {
+      let score = 0;
+      const words = req.split(/\s+/);
+      for (const w of words) {
+        if (offering.name.toLowerCase().includes(w)) score += 5;
+        if (offering.description.toLowerCase().includes(w)) score += 2;
+      }
+      if (score > bestScore) { bestScore = score; best = offering; }
+    }
+    return bestScore >= 5 ? best : null;
+  }
+
+  private extractParams(job: AcpJob, jobDesc: string): Record<string, any> {
+    if (job.params && Object.keys(job.params).length > 0) return job.params;
+    try {
+      const jsonMatch = jobDesc.match(/\{[\s\S]*\}/);
+      if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    } catch {}
+    return { raw_request: jobDesc };
+  }
+
+  // ─── Stats ──────────────────────────────────────────────────
 
   printStats() {
     const margin = this.stats.totalRevenue - this.stats.totalGatewayCost;
     console.log(
-      `[stats] Jobs: ${this.stats.totalJobs} | ✓ ${this.stats.successfulJobs} | ✗ ${this.stats.failedJobs} | Rev: $${this.stats.totalRevenue.toFixed(2)} | Cost: $${this.stats.totalGatewayCost.toFixed(3)} | Margin: $${margin.toFixed(2)}`,
+      `[stats] Jobs: ${this.stats.totalJobs} | ✓ ${this.stats.successfulJobs} | ✗ ${this.stats.failedJobs} | ` +
+      `Claude: ${this.stats.claudeJobs} | Keyword: ${this.stats.keywordJobs} | ` +
+      `Rev: $${this.stats.totalRevenue.toFixed(2)} | Cost: $${this.stats.totalGatewayCost.toFixed(3)} | Margin: $${margin.toFixed(2)}`
     );
   }
 
-  getStats() {
-    return { ...this.stats };
-  }
+  getStats() { return { ...this.stats }; }
 }

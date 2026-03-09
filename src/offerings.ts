@@ -1,4 +1,12 @@
-﻿export interface JobOffering {
+/**
+ * offerings.ts
+ *
+ * Source of truth for all Spraay ACP job offerings.
+ * Maps ACP service names → gateway endpoints with pricing.
+ * Used by both the keyword router (fallback) and Claude engine (tool definitions).
+ */
+
+export interface JobOffering {
   id: string;
   name: string;
   description: string;
@@ -85,7 +93,7 @@ const aiInference: JobOffering = {
   name: "AI Inference",
   description: "Pay-per-call access to 200+ LLM models via OpenRouter.",
   tier: 1, acpPrice: "0.25", gatewayEndpoint: "/api/v1/ai/chat", gatewayMethod: "POST",
-  gatewayCost: "0.01", category: "AI", estimatedDuration: "5-15s",
+  gatewayCost: "0.03", category: "AI", estimatedDuration: "5-15s",
   inputSchema: {
     model: { type: "string", required: true },
     messages: { type: "array", required: true },
@@ -100,7 +108,7 @@ const bridgeTokens: JobOffering = {
   name: "Bridge Tokens",
   description: "Cross-chain token transfers across 11 chains.",
   tier: 2, acpPrice: "1.50", gatewayEndpoint: "/api/v1/bridge/transfer", gatewayMethod: "POST",
-  gatewayCost: "0.02", category: "Financial", estimatedDuration: "1-5 min",
+  gatewayCost: "0.05", category: "Financial", estimatedDuration: "1-5 min",
   inputSchema: {
     from_chain: { type: "string", required: true },
     to_chain: { type: "string", required: true },
@@ -116,7 +124,7 @@ const createEscrow: JobOffering = {
   name: "Create Escrow",
   description: "Conditional payment escrows with milestone or time-lock release.",
   tier: 2, acpPrice: "1.50", gatewayEndpoint: "/api/v1/escrow/create", gatewayMethod: "POST",
-  gatewayCost: "0.02", category: "Financial", estimatedDuration: "10s",
+  gatewayCost: "0.10", category: "Financial", estimatedDuration: "10s",
   inputSchema: {
     token: { type: "string", required: true },
     amount: { type: "string", required: true },
@@ -227,6 +235,8 @@ const qna: JobOffering = {
   live: true
 };
 
+// ─── Exports ──────────────────────────────────────────────────
+
 export const JOB_OFFERINGS: JobOffering[] = [
   batchPayroll, tokenSwap, createInvoice, priceFeed, aiInference,
   bridgeTokens, createEscrow, webSearch, walletAnalytics,
@@ -238,10 +248,10 @@ export const OFFERING_MAP = new Map(JOB_OFFERINGS.map((j) => [j.id, j]));
 
 export const AGENT_PROFILE = {
   name: "Spraay Agent",
-  description: "Full-stack crypto infrastructure agent on Virtuals ACP. Batch payments, swaps, bridging, invoicing, AI inference, web search, and more via x402 gateway on Base.",
+  description: "Full-stack crypto infrastructure agent on Virtuals ACP. Batch payments, swaps, bridging, invoicing, AI inference, web search, and more via x402 gateway on Base. Powered by Claude reasoning.",
   website: "https://spraay.app",
   docs: "https://docs.spraay.app",
-  github: "https://github.com/plagtech/spraay-acp-agent",
+  github: "https://github.com/plagtech/spraay-acp-provider",
   twitter: "@Spraay_app",
   totalOfferings: JOB_OFFERINGS.length,
   liveOfferings: LIVE_OFFERINGS.length

@@ -1,4 +1,12 @@
-import { OFFERING_MAP } from "./offerings.js";
+/**
+ * gateway-client.ts
+ *
+ * HTTP client for calling Spraay x402 Gateway endpoints.
+ * Supports x402 micropayments via x402-fetch + viem wallet.
+ * Falls back to plain HTTP for free endpoints if no x402 key.
+ */
+
+import { OFFERING_MAP, type JobOffering } from "./offerings.js";
 
 export interface GatewayResponse {
   success: boolean;
@@ -6,6 +14,7 @@ export interface GatewayResponse {
   error?: string;
   latencyMs: number;
   gatewayCost: string;
+  endpoint: string;
 }
 
 export class SpraayGatewayClient {
@@ -29,7 +38,6 @@ export class SpraayGatewayClient {
     }
 
     try {
-      // x402-fetch uses viem under the hood
       const { wrapFetchWithPayment } = await import("x402-fetch");
       const { createWalletClient, http } = await import("viem");
       const { privateKeyToAccount } = await import("viem/accounts");
@@ -46,31 +54,50 @@ export class SpraayGatewayClient {
         chain: base,
       });
 
-      this.fetchWithPay = wrapFetchWithPayment(fetch, walletClient);
+      this.fetchWithPay = wrapFetchWithPayment(fetch, walletClient as any);
       console.log(`[gateway] x402 client initialized (${account.address.slice(0, 8)}...)`);
     } catch (err: any) {
       console.warn(`[gateway] x402-fetch init failed: ${err.message}`);
-      console.warn("[gateway] Install: npm install x402-fetch viem");
       console.warn("[gateway] Falling back to plain HTTP (free endpoints only)");
     }
   }
 
   /**
-   * Execute a job by calling the Spraay x402 gateway.
+   * Execute a job by offering ID (used by keyword router fallback).
    */
-  async executeJob(offeringId: string, params: Record<string, any>): Promise<GatewayResponse> {
+  async executeByOffering(offeringId: string, params: Record<string, any>): Promise<GatewayResponse> {
     const offering = OFFERING_MAP.get(offeringId);
     if (!offering) {
-      return { success: false, error: `Unknown offering: ${offeringId}`, latencyMs: 0, gatewayCost: "0" };
+      return { success: false, error: `Unknown offering: ${offeringId}`, latencyMs: 0, gatewayCost: "0", endpoint: "unknown" };
     }
+    return this.callEndpoint(offering.gatewayEndpoint, offering.gatewayMethod, params, offering.gatewayCost);
+  }
 
+  /**
+   * Execute a raw gateway call by path + method (used by Claude engine).
+   */
+  async executeRaw(
+    path: string,
+    method: "GET" | "POST",
+    params: Record<string, any>,
+    costUsd: string = "0"
+  ): Promise<GatewayResponse> {
+    return this.callEndpoint(path, method, params, costUsd);
+  }
+
+  /**
+   * Core HTTP call with x402 payment support.
+   */
+  private async callEndpoint(
+    endpoint: string,
+    method: "GET" | "POST",
+    params: Record<string, any>,
+    gatewayCost: string
+  ): Promise<GatewayResponse> {
     const start = Date.now();
     try {
-      const endpoint = offering.gatewayEndpoint;
-      const method = offering.gatewayMethod;
-
-      // Build the URL
       let url = `${this.baseUrl}${endpoint}`;
+
       if (method === "GET") {
         const qs = new URLSearchParams();
         for (const [k, v] of Object.entries(params)) {
@@ -80,9 +107,7 @@ export class SpraayGatewayClient {
         if (qsStr) url += `?${qsStr}`;
       }
 
-      // Pick fetch function: x402-enabled or plain
       const doFetch = this.fetchWithPay || fetch;
-
       const fetchOpts: RequestInit = {
         method,
         headers: { "Content-Type": "application/json" },
@@ -100,27 +125,26 @@ export class SpraayGatewayClient {
         if (response.status === 402) {
           return {
             success: false,
-            error: `402 Payment Required — x402 client not initialized. Set X402_WALLET_PRIVATE_KEY and install x402-fetch.`,
-            latencyMs,
-            gatewayCost: offering.gatewayCost,
+            error: `402 Payment Required — x402 client not initialized or insufficient funds. Set X402_WALLET_PRIVATE_KEY.`,
+            latencyMs, gatewayCost, endpoint,
           };
         }
         return {
           success: false,
           error: `Gateway ${response.status}: ${errorText.slice(0, 200)}`,
-          latencyMs,
-          gatewayCost: offering.gatewayCost,
+          latencyMs, gatewayCost, endpoint,
         };
       }
 
       const data = await response.json();
-      return { success: true, data, latencyMs, gatewayCost: offering.gatewayCost };
+      return { success: true, data, latencyMs, gatewayCost, endpoint };
     } catch (err: any) {
       return {
         success: false,
         error: `Gateway error: ${err.message}`,
         latencyMs: Date.now() - start,
         gatewayCost: "0",
+        endpoint,
       };
     }
   }
