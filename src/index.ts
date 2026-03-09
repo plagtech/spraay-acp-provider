@@ -116,24 +116,48 @@ async function main() {
         CONFIG.sellerWalletAddress,
         CONFIG.customRpcUrl,
       );
+      // Track which jobs we've already handled to avoid double-processing
+      const handledJobs = new Set<number>();
+
       const acpClient = new AcpClient({
         acpContractClient,
+        onNewTask: async (job: any) => {
+          if (handledJobs.has(job.id)) return;
+          handledJobs.add(job.id);
+          console.log(`[event] New task received: ${job.id}`);
+          try {
+            await handler.handleJob(job);
+          } catch (err: any) {
+            console.error(`[event] Job ${job.id} error: ${err.message?.slice(0, 100)}`);
+          }
+        },
+        onEvaluate: async (job: any) => {
+          console.log(`[event] Evaluation for job: ${job.id}`);
+        },
       });
-      // Don't call acpClient.init() — avoids websocket auth issues
-      console.log("[boot] ✓ Connected to ACP — polling mode\n");
 
-      // Poll for new jobs every 30 seconds
+      await acpClient.init();
+      console.log("[boot] ✓ Connected to ACP (event + polling mode)\n");
+
+      // Also poll as backup every 30 seconds
       setInterval(async () => {
         try {
           const activeJobs = await acpClient.getActiveJobs(1, 10);
           if (activeJobs && activeJobs.length > 0) {
             for (const job of activeJobs) {
+              if (handledJobs.has(job.id)) continue;
+              handledJobs.add(job.id);
               console.log(`[poll] Found job: ${job.id}`);
               await handler.handleJob(job);
             }
           }
         } catch (err: any) {
           console.warn(`[poll] Error: ${err.message?.slice(0, 100)}`);
+        }
+        // Clean up old handled job IDs (keep last 100)
+        if (handledJobs.size > 100) {
+          const arr = Array.from(handledJobs);
+          arr.slice(0, arr.length - 100).forEach((id) => handledJobs.delete(id));
         }
       }, 30000);
     } catch (err: any) {
