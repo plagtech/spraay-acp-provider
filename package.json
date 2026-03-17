@@ -1,32 +1,33 @@
 {
   "name": "spraay-acp-provider",
   "version": "2.0.0",
-  "description": "Spraay ACP Provider — Claude-powered crypto infrastructure agent on Virtuals Protocol",
-  "type": "module",
+  "description": "Spraay ACP Provider Agent — GAME SDK powered batch payment services on Virtuals Protocol",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
-    "mock": "MOCK_MODE=true tsx src/index.ts",
-    "test-claude": "tsx src/test-claude.ts"
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
-    "@virtuals-protocol/acp-node": "^0.3.0-beta.38",
-    "dotenv": "^16.4.7",
-    "viem": "^2.23.0",
-    "x402-fetch": "^1.1.0"
-  },
-  "devDependencies": {
-    "@types/node": "^22.0.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "dev": "ts-node src/index.ts"
   },
   "keywords": [
-    "acp", "virtuals", "spraay", "x402",
-    "base", "agent", "claude", "ai-agent"
+    "spraay",
+    "acp",
+    "virtuals",
+    "game-sdk",
+    "x402",
+    "batch-payments",
+    "ai-agent"
   ],
   "author": "plagtech",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@virtuals-protocol/game": "^0.1.14",
+    "dotenv": "^17.3.1",
+    "node-fetch": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/node-fetch": "^2.6.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.0"
+  }
 }
